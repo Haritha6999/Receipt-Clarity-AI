@@ -1,12 +1,14 @@
 import { initializeApp } from 'firebase/app';
 import { getAuth, GoogleAuthProvider, signInWithPopup, signOut, onAuthStateChanged, User } from 'firebase/auth';
 import { getFirestore, collection, doc, setDoc, getDoc, getDocs, query, where, orderBy, onSnapshot, addDoc, deleteDoc, updateDoc, Timestamp, getDocFromServer } from 'firebase/firestore';
+import { getStorage, ref, uploadBytes, getDownloadURL, deleteObject } from 'firebase/storage';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // Initialize Firebase SDK
 const app = initializeApp(firebaseConfig);
 export const db = getFirestore(app, firebaseConfig.firestoreDatabaseId);
 export const auth = getAuth(app);
+export const storage = getStorage(app);
 export const googleProvider = new GoogleAuthProvider();
 
 // Auth Helpers
@@ -91,6 +93,10 @@ export {
   deleteDoc,
   updateDoc,
   Timestamp,
-  onAuthStateChanged
+  onAuthStateChanged,
+  ref,
+  uploadBytes,
+  getDownloadURL,
+  deleteObject
 };
 export type { User };
