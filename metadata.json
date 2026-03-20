@@ -1,0 +1,5 @@
+{
+  "name": "Receipt Clarity AI",
+  "description": "Turn messy physical bills and receipts into organized Excel spreadsheets using AI vision.",
+  "requestFramePermissions": []
+}
