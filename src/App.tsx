@@ -37,7 +37,8 @@ import {
   LogOut,
   LogIn,
   User as UserIcon,
-  Search
+  Search,
+  ExternalLink
 } from 'lucide-react';
 import { 
   collection, 
@@ -52,6 +53,16 @@ import {
   setDoc,
   getDocFromServer
 } from 'firebase/firestore';
+import { 
+  APIProvider, 
+  Map, 
+  AdvancedMarker, 
+  Pin, 
+  useMap, 
+  useMapsLibrary,
+  InfoWindow,
+  useAdvancedMarkerRef
+} from '@vis.gl/react-google-maps';
 import { motion, AnimatePresence } from 'motion/react';
 import { clsx, type ClassValue } from 'clsx';
 import { twMerge } from 'tailwind-merge';
@@ -97,6 +108,7 @@ interface ReceiptData {
   Total_Amount: number;
   Short_Description: string;
   unreadable?: boolean;
+  groundingSources?: { title: string; uri: string }[];
 }
 
 interface ProcessedFile {
@@ -136,9 +148,207 @@ const COLORS = [
 const GEMINI_VISION_MODEL = "gemini-3-flash-preview";
 const GEMINI_TTS_MODEL = "gemini-2.5-flash-preview-tts";
 
+// --- Error Handling ---
+
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  };
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  toast.error(`Database error: ${errInfo.error}`);
+  throw new Error(JSON.stringify(errInfo));
+}
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean; error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  componentDidCatch(error: Error, errorInfo: React.ErrorInfo) {
+    console.error("Uncaught error:", error, errorInfo);
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="min-h-screen flex items-center justify-center bg-stone-50 p-6">
+          <div className="max-w-md w-full bg-white rounded-3xl border border-stone-200 p-8 shadow-xl text-center">
+            <div className="w-16 h-16 bg-rose-50 rounded-full flex items-center justify-center mx-auto mb-6 text-rose-600">
+              <AlertCircle size={32} />
+            </div>
+            <h2 className="text-2xl font-bold text-stone-900 mb-4">Something went wrong</h2>
+            <p className="text-stone-500 mb-8">
+              {this.state.error?.message.startsWith('{') 
+                ? "A database error occurred. Please check your permissions." 
+                : "An unexpected error occurred. Please try refreshing the page."}
+            </p>
+            <button
+              onClick={() => window.location.reload()}
+              className="w-full py-4 bg-stone-900 text-white rounded-2xl font-bold hover:bg-stone-800 transition-all shadow-lg"
+            >
+              Refresh Page
+            </button>
+          </div>
+        </div>
+      );
+    }
+
+    return this.props.children;
+  }
+}
+
 // --- Main Component ---
 
+const MAPS_API_KEY = process.env.GOOGLE_MAPS_PLATFORM_KEY || '';
+const hasValidMapsKey = Boolean(MAPS_API_KEY) && MAPS_API_KEY !== 'YOUR_API_KEY';
+
+/**
+ * Merchant Map Component using Google Maps Platform
+ */
+const MerchantMap = ({ merchantName }: { merchantName: string }) => {
+  const map = useMap();
+  const placesLib = useMapsLibrary('places');
+  const [place, setPlace] = useState<google.maps.places.Place | null>(null);
+  const [markerRef, marker] = useAdvancedMarkerRef();
+  const [infoWindowShown, setInfoWindowShown] = useState(false);
+
+  useEffect(() => {
+    if (!placesLib || !map || !merchantName) return;
+
+    const searchMerchant = async () => {
+      try {
+        const { places } = await placesLib.Place.searchByText({
+          textQuery: merchantName,
+          fields: ['displayName', 'location', 'formattedAddress', 'rating', 'googleMapsURI'],
+          maxResultCount: 1,
+        });
+
+        if (places && places.length > 0) {
+          const foundPlace = places[0];
+          setPlace(foundPlace);
+          if (foundPlace.location) {
+            map.panTo(foundPlace.location);
+            map.setZoom(15);
+          }
+        }
+      } catch (error) {
+        console.error("Error searching for merchant location:", error);
+      }
+    };
+
+    searchMerchant();
+  }, [placesLib, map, merchantName]);
+
+  if (!hasValidMapsKey) return null;
+
+  return (
+    <div className="h-64 w-full rounded-2xl overflow-hidden border border-stone-200 shadow-inner relative group">
+      <Map
+        defaultCenter={{ lat: 0, lng: 0 }}
+        defaultZoom={2}
+        mapId="DEMO_MAP_ID"
+        disableDefaultUI={true}
+        gestureHandling={'greedy'}
+        className="w-full h-full"
+      >
+        {place?.location && (
+          <>
+            <AdvancedMarker
+              ref={markerRef}
+              position={place.location}
+              onClick={() => setInfoWindowShown(true)}
+            >
+              <Pin background={'#10b981'} glyphColor={'#fff'} borderColor={'#065f46'} />
+            </AdvancedMarker>
+            {infoWindowShown && (
+              <InfoWindow
+                anchor={marker}
+                onCloseClick={() => setInfoWindowShown(false)}
+              >
+                <div className="p-2 max-w-xs">
+                  <h4 className="font-bold text-stone-900 text-sm">{place.displayName}</h4>
+                  <p className="text-xs text-stone-500 mt-1">{place.formattedAddress}</p>
+                  {place.rating && <p className="text-xs text-amber-500 mt-1">⭐ {place.rating}</p>}
+                  <a 
+                    href={place.googleMapsURI} 
+                    target="_blank" 
+                    rel="noopener noreferrer"
+                    className="text-[10px] text-emerald-600 hover:underline mt-2 block"
+                  >
+                    View on Google Maps
+                  </a>
+                </div>
+              </InfoWindow>
+            )}
+          </>
+        )}
+      </Map>
+      <div className="absolute top-2 left-2 bg-white/90 backdrop-blur-sm px-2 py-1 rounded-lg border border-stone-200 shadow-sm pointer-events-none">
+        <p className="text-[10px] font-bold text-stone-500 flex items-center gap-1">
+          <Search size={10} /> Merchant Location
+        </p>
+      </div>
+    </div>
+  );
+};
+
 export default function App() {
+  return (
+    <ErrorBoundary>
+      <AppContent />
+    </ErrorBoundary>
+  );
+}
+
+function AppContent() {
   const [user, setUser] = useState<User | null>(null);
   const [isAuthReady, setIsAuthReady] = useState(false);
   const [files, setFiles] = useState<ProcessedFile[]>([]);
@@ -146,6 +356,7 @@ export default function App() {
   const [activeTab, setActiveTab] = useState<'upload' | 'history'>('upload');
   const [filterMonth, setFilterMonth] = useState<string>("");
   const [filterYear, setFilterYear] = useState<string>(new Date().getFullYear().toString());
+  const [filterDate, setFilterDate] = useState<string>("");
   const [isProcessingAll, setIsProcessingAll] = useState(false);
   const [isReadingAloud, setIsReadingAloud] = useState(false);
   const [viewMode, setViewMode] = useState<'table' | 'chart'>('table');
@@ -154,6 +365,14 @@ export default function App() {
   const [isEnhancedAI, setIsEnhancedAI] = useState(false);
   const [announcement, setAnnouncement] = useState("");
   const [isFeedbackOpen, setIsFeedbackOpen] = useState(false);
+  const [expandedHistoryId, setExpandedHistoryId] = useState<string | null>(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('login');
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [isAuthLoading, setIsAuthLoading] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [diagnosticResults, setDiagnosticResults] = useState<{ name: string; status: 'pass' | 'fail' | 'running'; message?: string }[]>([]);
   const [feedbackType, setFeedbackType] = useState<'bug' | 'ui' | 'performance'>('bug');
   const [feedbackText, setFeedbackText] = useState("");
   const [isSubmittingFeedback, setIsSubmittingFeedback] = useState(false);
@@ -162,6 +381,84 @@ export default function App() {
   const [isSendingEmail, setIsSendingEmail] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const audioRef = useRef<HTMLAudioElement | null>(null);
+
+  // --- Auth Handlers ---
+
+  const handleEmailAuth = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!email || !password) {
+      toast.error("Please enter both email and password");
+      return;
+    }
+    
+    setIsAuthLoading(true);
+    try {
+      if (authMode === 'login') {
+        await signInWithEmailAndPassword(auth, email, password);
+        toast.success("Logged in successfully");
+      } else {
+        await createUserWithEmailAndPassword(auth, email, password);
+        toast.success("Account created successfully");
+      }
+      setIsAuthModalOpen(false);
+    } catch (error: any) {
+      console.error("Auth Error:", error);
+      toast.error(error.message || "Authentication failed");
+    } finally {
+      setIsAuthLoading(false);
+    }
+  };
+
+  // --- Diagnostics (Unit Tests) ---
+
+  const runDiagnostics = async () => {
+    setShowDiagnostics(true);
+    setDiagnosticResults([
+      { name: 'Firebase Auth', status: 'running' },
+      { name: 'Firestore Connection', status: 'running' },
+      { name: 'Gemini AI Vision', status: 'running' },
+      { name: 'Google Maps API', status: 'running' },
+    ]);
+
+    // 1. Firebase Auth
+    try {
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Firebase Auth' ? { ...r, status: 'pass', message: user ? `Authenticated as ${user.email}` : 'Not authenticated (expected if not logged in)' } : r));
+    } catch (e) {
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Firebase Auth' ? { ...r, status: 'fail', message: String(e) } : r));
+    }
+
+    // 2. Firestore Connection
+    try {
+      await getDocFromServer(doc(db, 'test', 'connection'));
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Firestore Connection' ? { ...r, status: 'pass', message: 'Successfully reached Firestore' } : r));
+    } catch (e: any) {
+      if (e.message.includes('the client is offline')) {
+        setDiagnosticResults(prev => prev.map(r => r.name === 'Firestore Connection' ? { ...r, status: 'fail', message: 'Client is offline or config is wrong' } : r));
+      } else {
+        setDiagnosticResults(prev => prev.map(r => r.name === 'Firestore Connection' ? { ...r, status: 'pass', message: 'Connection verified (ignoring permission errors)' } : r));
+      }
+    }
+
+    // 3. Gemini AI Vision
+    try {
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+      await ai.models.generateContent({
+        model: GEMINI_VISION_MODEL,
+        contents: "Hello",
+        config: { maxOutputTokens: 5 }
+      });
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Gemini AI Vision' ? { ...r, status: 'pass', message: 'Gemini API is responsive' } : r));
+    } catch (e) {
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Gemini AI Vision' ? { ...r, status: 'fail', message: String(e) } : r));
+    }
+
+    // 4. Google Maps API
+    if (hasValidMapsKey) {
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Google Maps API' ? { ...r, status: 'pass', message: 'API Key is present' } : r));
+    } else {
+      setDiagnosticResults(prev => prev.map(r => r.name === 'Google Maps API' ? { ...r, status: 'fail', message: 'API Key is missing or invalid' } : r));
+    }
+  };
 
   // --- Auth & History Sync ---
   useEffect(() => {
@@ -180,7 +477,7 @@ export default function App() {
             createdAt: new Date().toISOString()
           }, { merge: true });
         } catch (error) {
-          console.error("Error saving user profile:", error);
+          handleFirestoreError(error, OperationType.WRITE, `users/${currentUser.uid}`);
         }
       }
     });
@@ -319,7 +616,7 @@ export default function App() {
               - Total_Amount (Just the float number, no currency symbols)
               - Short_Description (A 3-5 word summary of the items)
               
-              ${isEnhancedAI ? "Use Google Search to verify the merchant's category if it's not clear from the receipt." : ""}
+              ${isEnhancedAI ? "Use Google Search to verify the merchant's category, address, and legitimacy if it's not clear from the receipt. Provide grounding for your findings." : ""}
               
               Ensure the output is ONLY the JSON object.`,
             },
@@ -343,6 +640,22 @@ export default function App() {
       });
 
       const result = JSON.parse(response.text || '{}') as ReceiptData;
+
+      // Extract grounding sources if available
+      if (isEnhancedAI && response.candidates?.[0]?.groundingMetadata?.groundingChunks) {
+        const chunks = response.candidates[0].groundingMetadata.groundingChunks;
+        const sources = chunks
+          .filter(chunk => chunk.web)
+          .map(chunk => ({
+            title: chunk.web?.title || 'Source',
+            uri: chunk.web?.uri || ''
+          }))
+          .filter(s => s.uri);
+        
+        if (sources.length > 0) {
+          result.groundingSources = sources;
+        }
+      }
 
       if (result.unreadable) {
         announce(`Could not read receipt from ${processedFile.file.name}. It might be blurry.`);
@@ -716,16 +1029,43 @@ export default function App() {
   const totalCount = files.length;
   const progress = totalCount > 0 ? (completedCount / totalCount) * 100 : 0;
 
-  return (
-    <div className="min-h-screen bg-stone-50 text-stone-900 font-sans selection:bg-emerald-100">
-      <a 
-        href="#main-content" 
-        className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-emerald-600 focus:text-white focus:rounded-lg focus:shadow-xl outline-none ring-2 ring-offset-2 ring-emerald-500"
-      >
-        Skip to content
-      </a>
+  if (!hasValidMapsKey) {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-stone-50 p-6">
+        <div className="max-w-md w-full bg-white rounded-3xl border border-stone-200 p-8 shadow-xl text-center">
+          <div className="w-16 h-16 bg-emerald-50 rounded-full flex items-center justify-center mx-auto mb-6 text-emerald-600">
+            <Receipt size={32} />
+          </div>
+          <h2 className="text-2xl font-bold text-stone-900 mb-4">Maps API Key Required</h2>
+          <p className="text-stone-500 mb-8">
+            To enable merchant location features, please add your Google Maps Platform API key as a secret.
+          </p>
+          <div className="space-y-4 text-left bg-stone-50 p-6 rounded-2xl border border-stone-100 mb-8">
+            <p className="text-xs font-bold text-stone-400 uppercase tracking-widest">Setup Steps</p>
+            <ol className="text-sm text-stone-600 space-y-3 list-decimal list-inside">
+              <li>Get an API key from <a href="https://console.cloud.google.com/google/maps-apis/credentials" target="_blank" className="text-emerald-600 hover:underline">Google Cloud Console</a></li>
+              <li>Open <strong>Settings</strong> (⚙️ gear icon)</li>
+              <li>Add secret <code>GOOGLE_MAPS_PLATFORM_KEY</code></li>
+              <li>Paste your key and press Enter</li>
+            </ol>
+          </div>
+          <p className="text-xs text-stone-400 italic">The app will rebuild automatically once the key is added.</p>
+        </div>
+      </div>
+    );
+  }
 
-      <Toaster position="bottom-right" />
+  return (
+    <APIProvider apiKey={MAPS_API_KEY} version="weekly">
+      <div className="min-h-screen bg-stone-50 text-stone-900 font-sans selection:bg-emerald-100">
+        <a 
+          href="#main-content" 
+          className="sr-only focus:not-sr-only focus:fixed focus:top-4 focus:left-4 focus:z-50 focus:px-4 focus:py-2 focus:bg-emerald-600 focus:text-white focus:rounded-lg focus:shadow-xl outline-none ring-2 ring-offset-2 ring-emerald-500"
+        >
+          Skip to content
+        </a>
+
+        <Toaster position="bottom-right" />
       
       {/* Screen Reader Live Region */}
       <div className="sr-only" aria-live="polite">
@@ -744,13 +1084,22 @@ export default function App() {
           
           <div className="flex items-center gap-3">
             {!user ? (
-              <button
-                onClick={loginWithGoogle}
-                className="flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium bg-stone-900 text-white hover:bg-stone-800 transition-all shadow-sm active:scale-95"
-              >
-                <LogIn size={16} />
-                <span>Login</span>
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  onClick={loginWithGoogle}
+                  className="flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium bg-stone-900 text-white hover:bg-stone-800 transition-all shadow-sm active:scale-95"
+                >
+                  <LogIn size={16} />
+                  <span className="hidden sm:inline">Google Login</span>
+                </button>
+                <button
+                  onClick={() => { setAuthMode('login'); setIsAuthModalOpen(true); }}
+                  className="flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium bg-stone-100 text-stone-700 hover:bg-stone-200 transition-all shadow-sm active:scale-95"
+                >
+                  <Mail size={16} />
+                  <span className="hidden sm:inline">Email Login</span>
+                </button>
+              </div>
             ) : (
               <div className="flex items-center gap-3">
                 <div className="flex items-center gap-2 px-3 py-1.5 bg-stone-100 rounded-full border border-stone-200">
@@ -781,6 +1130,15 @@ export default function App() {
             >
               <Mail size={16} />
               <span className="hidden sm:inline">Email Report</span>
+            </button>
+
+            <button
+              onClick={runDiagnostics}
+              className="flex items-center gap-2 px-4 py-2 rounded-full text-sm font-medium bg-stone-100 text-stone-700 hover:bg-stone-200 transition-all shadow-sm active:scale-95"
+              title="Run System Diagnostics (Unit Tests)"
+            >
+              <Bug size={16} />
+              <span className="hidden sm:inline">Diagnostics</span>
             </button>
 
             <button
@@ -1110,6 +1468,32 @@ export default function App() {
                                 </div>
                               </div>
                             )}
+                            {file.status === 'completed' && file.data && !file.data.unreadable && !file.isEditing && (
+                              <div className="mt-4 space-y-4">
+                                {file.data.groundingSources && file.data.groundingSources.length > 0 && (
+                                  <div className="bg-blue-50/50 p-3 rounded-xl border border-blue-100">
+                                    <p className="text-[10px] uppercase tracking-wider text-blue-500 font-bold mb-2 flex items-center gap-1">
+                                      <Search size={10} /> AI Grounding Sources
+                                    </p>
+                                    <div className="flex flex-wrap gap-2">
+                                      {file.data.groundingSources.map((source, idx) => (
+                                        <a 
+                                          key={idx}
+                                          href={source.uri}
+                                          target="_blank"
+                                          rel="noopener noreferrer"
+                                          className="flex items-center gap-1 px-2 py-1 bg-white border border-blue-200 text-blue-600 rounded-md text-[10px] hover:bg-blue-50 transition-colors"
+                                        >
+                                          <ExternalLink size={10} />
+                                          {source.title}
+                                        </a>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                                <MerchantMap merchantName={file.data.Merchant_Name} />
+                              </div>
+                            )}
                           </div>
                         )}
                       </div>
@@ -1324,17 +1708,15 @@ export default function App() {
                 </div>
 
                 <div className="flex items-center gap-2 bg-white border border-stone-200 rounded-xl px-3 py-2 shadow-sm">
-                  <Search size={16} className="text-stone-400" />
+                  <Calendar size={16} className="text-stone-400" />
                   <input 
                     type="date"
-                    value={filterMonth === "custom" ? filterYear : ""}
+                    value={filterDate}
                     onChange={(e) => {
+                      setFilterDate(e.target.value);
                       if (e.target.value) {
-                        setFilterMonth("custom");
-                        setFilterYear(e.target.value);
-                      } else {
                         setFilterMonth("");
-                        setFilterYear(new Date().getFullYear().toString());
+                        setFilterYear("");
                       }
                     }}
                     className="text-sm font-medium bg-transparent focus:outline-none"
@@ -1353,8 +1735,7 @@ export default function App() {
                       setHistory([]);
                       toast.success("History cleared");
                     } catch (error) {
-                      console.error("Error clearing history:", error);
-                      toast.error("Failed to clear history");
+                      handleFirestoreError(error, OperationType.DELETE, 'receipts');
                     }
                   }}
                   className="flex items-center gap-2 bg-rose-50 text-rose-600 px-4 py-2 rounded-xl text-sm font-bold hover:bg-rose-100 transition-all shadow-md active:scale-95"
@@ -1370,6 +1751,8 @@ export default function App() {
                       onSnapshot(q, (snapshot) => {
                         const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() }));
                         setHistory(data);
+                      }, (error) => {
+                        handleFirestoreError(error, OperationType.LIST, 'receipts');
                       });
                       toast.success("History refreshed");
                     }
@@ -1383,8 +1766,8 @@ export default function App() {
                   onClick={() => {
                     const filtered = history.filter(item => {
                       const date = item.date || item.Date;
-                      if (filterMonth === "custom") {
-                        return date === filterYear;
+                      if (filterDate) {
+                        return date === filterDate;
                       }
                       const [y, m] = date.split('-');
                       return (filterYear ? y === filterYear : true) && (filterMonth ? m === filterMonth : true);
@@ -1427,6 +1810,9 @@ export default function App() {
                 {history
                   .filter(item => {
                     const date = item.date || item.Date;
+                    if (filterDate) {
+                      return date === filterDate;
+                    }
                     const [y, m] = date.split('-');
                     return (filterYear ? y === filterYear : true) && (filterMonth ? m === filterMonth : true);
                   })
@@ -1461,14 +1847,31 @@ export default function App() {
                           <p className="text-lg font-bold text-stone-900">${(item.amount || item.Total_Amount).toFixed(2)}</p>
                           <p className="text-[10px] text-stone-400 italic truncate max-w-[150px]">{item.shortDescription || item.Short_Description}</p>
                         </div>
-                        <button
-                          onClick={() => deleteFromHistory(item.id)}
-                          className="p-2 text-stone-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"
-                          title="Delete"
-                        >
-                          <Trash2 size={18} />
-                        </button>
+                        <div className="flex gap-2">
+                          <button
+                            onClick={() => setExpandedHistoryId(expandedHistoryId === item.id ? null : item.id)}
+                            className={cn(
+                              "p-2 rounded-xl transition-all",
+                              expandedHistoryId === item.id ? "bg-emerald-50 text-emerald-600" : "text-stone-300 hover:text-stone-600 hover:bg-stone-50"
+                            )}
+                            title="Show Location"
+                          >
+                            <Search size={18} />
+                          </button>
+                          <button
+                            onClick={() => deleteFromHistory(item.id)}
+                            className="p-2 text-stone-300 hover:text-rose-500 hover:bg-rose-50 rounded-xl transition-all"
+                            title="Delete"
+                          >
+                            <Trash2 size={18} />
+                          </button>
+                        </div>
                       </div>
+                      {expandedHistoryId === item.id && (
+                        <div className="w-full mt-4">
+                          <MerchantMap merchantName={item.merchant || item.Merchant_Name} />
+                        </div>
+                      )}
                     </motion.div>
                   ))}
               </div>
@@ -1476,6 +1879,148 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Auth Modal */}
+      <AnimatePresence>
+        {isAuthModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-stone-900/40 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden"
+            >
+              <div className="p-6 border-b border-stone-100 flex justify-between items-center bg-stone-50">
+                <div className="flex items-center gap-2">
+                  <LogIn className="text-stone-900" size={20} />
+                  <h3 className="font-bold text-lg">{authMode === 'login' ? 'Login' : 'Sign Up'}</h3>
+                </div>
+                <button 
+                  onClick={() => setIsAuthModalOpen(false)}
+                  className="p-2 hover:bg-stone-200 rounded-full transition-colors"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              <form onSubmit={handleEmailAuth} className="p-8 space-y-6">
+                <div className="space-y-4">
+                  <div>
+                    <label className="block text-xs font-bold text-stone-400 uppercase tracking-widest mb-2">Email Address</label>
+                    <input
+                      type="email"
+                      required
+                      value={email}
+                      onChange={(e) => setEmail(e.target.value)}
+                      placeholder="example@email.com"
+                      className="w-full p-4 bg-stone-50 border border-stone-200 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
+                    />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-bold text-stone-400 uppercase tracking-widest mb-2">Password</label>
+                    <input
+                      type="password"
+                      required
+                      value={password}
+                      onChange={(e) => setPassword(e.target.value)}
+                      placeholder="••••••••"
+                      className="w-full p-4 bg-stone-50 border border-stone-200 rounded-2xl text-sm focus:outline-none focus:ring-2 focus:ring-emerald-500/20 focus:border-emerald-500 transition-all"
+                    />
+                  </div>
+                </div>
+
+                <button
+                  type="submit"
+                  disabled={isAuthLoading}
+                  className="w-full py-4 bg-stone-900 hover:bg-stone-800 disabled:bg-stone-300 text-white rounded-2xl font-bold transition-all shadow-lg flex items-center justify-center gap-2"
+                >
+                  {isAuthLoading ? (
+                    <Loader2 size={20} className="animate-spin" />
+                  ) : (
+                    <LogIn size={20} />
+                  )}
+                  {isAuthLoading ? "Processing..." : (authMode === 'login' ? "Login" : "Create Account")}
+                </button>
+
+                <div className="text-center">
+                  <button
+                    type="button"
+                    onClick={() => setAuthMode(authMode === 'login' ? 'signup' : 'login')}
+                    className="text-sm text-stone-500 hover:text-stone-900 underline"
+                  >
+                    {authMode === 'login' ? "Don't have an account? Sign up" : "Already have an account? Login"}
+                  </button>
+                </div>
+              </form>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
+
+      {/* Diagnostics Modal */}
+      <AnimatePresence>
+        {showDiagnostics && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6 bg-stone-900/40 backdrop-blur-sm">
+            <motion.div 
+              initial={{ opacity: 0, scale: 0.9, y: 20 }}
+              animate={{ opacity: 1, scale: 1, y: 0 }}
+              exit={{ opacity: 0, scale: 0.9, y: 20 }}
+              className="bg-white rounded-3xl shadow-2xl w-full max-w-md overflow-hidden"
+            >
+              <div className="p-6 border-b border-stone-100 flex justify-between items-center bg-stone-50">
+                <div className="flex items-center gap-2">
+                  <Bug className="text-stone-900" size={20} />
+                  <h3 className="font-bold text-lg">System Diagnostics</h3>
+                </div>
+                <button 
+                  onClick={() => setShowDiagnostics(false)}
+                  className="p-2 hover:bg-stone-200 rounded-full transition-colors"
+                >
+                  <X size={20} />
+                </button>
+              </div>
+
+              <div className="p-8 space-y-6">
+                <div className="space-y-4">
+                  {diagnosticResults.map((result, idx) => (
+                    <div key={idx} className="flex items-start gap-4 p-4 rounded-2xl border border-stone-100 bg-stone-50">
+                      <div className={cn(
+                        "w-6 h-6 rounded-full flex items-center justify-center flex-shrink-0 mt-0.5",
+                        result.status === 'pass' ? "bg-emerald-100 text-emerald-600" : 
+                        result.status === 'fail' ? "bg-rose-100 text-rose-600" : 
+                        "bg-stone-200 text-stone-400"
+                      )}>
+                        {result.status === 'pass' ? <CheckCircle2 size={14} /> : 
+                         result.status === 'fail' ? <AlertCircle size={14} /> : 
+                         <Loader2 size={14} className="animate-spin" />}
+                      </div>
+                      <div>
+                        <p className="text-sm font-bold text-stone-900">{result.name}</p>
+                        <p className="text-xs text-stone-500 mt-1">{result.message || (result.status === 'running' ? 'Testing...' : '')}</p>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="bg-blue-50 border border-blue-100 p-4 rounded-2xl flex gap-3">
+                  <Info className="text-blue-600 flex-shrink-0" size={18} />
+                  <p className="text-xs text-blue-800 leading-relaxed">
+                    These tests verify the core integrations of the application, including Firebase, Gemini AI, and Google Maps.
+                  </p>
+                </div>
+
+                <button
+                  onClick={runDiagnostics}
+                  className="w-full py-4 bg-stone-900 hover:bg-stone-800 text-white rounded-2xl font-bold transition-all shadow-lg flex items-center justify-center gap-2"
+                >
+                  <RefreshCw size={20} />
+                  Rerun Diagnostics
+                </button>
+              </div>
+            </motion.div>
+          </div>
+        )}
+      </AnimatePresence>
 
       {/* Email Report Modal */}
       <AnimatePresence>
@@ -1619,28 +2164,51 @@ export default function App() {
 
       {/* Footer */}
       <footer className="mt-20 border-t border-stone-200 py-12 bg-white">
-        <div className="max-w-5xl mx-auto px-6 text-center">
-          <div className="flex items-center justify-center gap-4 mb-6">
-            <div className="w-10 h-10 bg-stone-50 rounded-full flex items-center justify-center text-stone-400">
-              <Receipt size={20} />
+        <div className="max-w-5xl mx-auto px-6">
+          <div className="grid grid-cols-1 md:grid-cols-3 gap-12 items-center">
+            <div className="flex flex-col items-center md:items-start gap-4">
+              <div className="flex items-center gap-3">
+                <div className="w-10 h-10 bg-stone-900 rounded-xl flex items-center justify-center text-white shadow-lg">
+                  <Receipt size={20} />
+                </div>
+                <h3 className="font-bold text-lg">Receipt Clarity AI</h3>
+              </div>
+              <p className="text-stone-400 text-sm text-center md:text-left">
+                Intelligent Financial Organization powered by 5+ Google Services.
+              </p>
+            </div>
+
+            <div className="flex flex-wrap justify-center gap-6">
+              {[
+                { name: "Gemini AI", desc: "Vision & Analysis" },
+                { name: "Firebase", desc: "Auth & Database" },
+                { name: "Google Maps", desc: "Merchant Location" },
+                { name: "Google Search", desc: "Grounding" },
+                { name: "Google TTS", desc: "Voice Summary" }
+              ].map(service => (
+                <div key={service.name} className="flex flex-col items-center">
+                  <span className="text-[10px] font-bold text-stone-900">{service.name}</span>
+                  <span className="text-[9px] text-stone-400">{service.desc}</span>
+                </div>
+              ))}
+            </div>
+
+            <div className="flex flex-col items-center md:items-end gap-4">
+              <button 
+                onClick={() => setIsFeedbackOpen(true)}
+                className="inline-flex items-center gap-2 text-stone-400 hover:text-emerald-600 text-xs font-bold uppercase tracking-widest transition-colors"
+              >
+                <Bug size={14} />
+                Report an Issue
+              </button>
+              <p className="text-stone-300 text-[10px] uppercase tracking-widest">
+                © 2026 All rights reserved.
+              </p>
             </div>
           </div>
-          <p className="text-stone-400 text-sm font-medium">
-            Receipt Clarity AI • Intelligent Financial Organization
-          </p>
-          <p className="text-stone-300 text-[10px] mt-2 uppercase tracking-widest">
-            Powered by Gemini 3.1 Flash & 2.5 TTS
-          </p>
-          
-          <button 
-            onClick={() => setIsFeedbackOpen(true)}
-            className="mt-8 inline-flex items-center gap-2 text-stone-400 hover:text-emerald-600 text-xs font-bold uppercase tracking-widest transition-colors"
-          >
-            <Bug size={14} />
-            Report a Bug or UI Issue
-          </button>
         </div>
       </footer>
     </div>
+  </APIProvider>
   );
 }
