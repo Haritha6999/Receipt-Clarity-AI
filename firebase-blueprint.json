@@ -1,0 +1,44 @@
+{
+  "entities": {
+    "User": {
+      "title": "User Profile",
+      "description": "Stores basic user information and preferences.",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Firebase Auth UID" },
+        "email": { "type": "string", "format": "email" },
+        "displayName": { "type": "string" },
+        "photoURL": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["uid", "email"]
+    },
+    "Receipt": {
+      "title": "Receipt Data",
+      "description": "Stores individual receipt information extracted from images.",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Owner's UID" },
+        "date": { "type": "string", "format": "date", "description": "Receipt date" },
+        "merchant": { "type": "string" },
+        "category": { "type": "string" },
+        "amount": { "type": "number" },
+        "currency": { "type": "string" },
+        "extractedText": { "type": "string" },
+        "imageUrl": { "type": "string" },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["userId", "date", "merchant", "amount", "currency"]
+    }
+  },
+  "firestore": {
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profile document"
+    },
+    "/receipts/{receiptId}": {
+      "schema": "Receipt",
+      "description": "Individual receipt records"
+    }
+  }
+}

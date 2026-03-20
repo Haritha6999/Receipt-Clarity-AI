@@ -1,0 +1,121 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {userId}
+    // Fields:
+    //   - uid: string (required) - Firebase Auth UID
+    //   - email: string (required) - User email
+    //   - displayName: string (optional)
+    //   - photoURL: string (optional)
+    //   - createdAt: string (required) - ISO 8601 timestamp
+    //
+    // Collection: receipts
+    // Document ID: {receiptId}
+    // Fields:
+    //   - userId: string (required) - Owner's UID
+    //   - date: string (required) - ISO 8601 date (YYYY-MM-DD)
+    //   - merchant: string (required)
+    //   - category: string (required)
+    //   - amount: number (required)
+    //   - currency: string (required)
+    //   - extractedText: string (optional)
+    //   - imageUrl: string (optional)
+    //   - createdAt: string (required) - ISO 8601 timestamp
+    //
+    // ===============================================================
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isDocOwner() {
+      return isAuthenticated() && request.auth.uid == resource.data.userId;
+    }
+
+    function uidUnchanged() {
+      return !('userId' in request.resource.data) ||
+        request.resource.data.userId == request.auth.uid;
+    }
+
+    function uidNotModified() {
+      return !('userId' in request.resource.data) ||
+        request.resource.data.userId == resource.data.userId;
+    }
+
+    function isValidEmail(email) {
+      return email is string &&
+        email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidDate(dateStr) {
+      return dateStr is string && dateStr.matches("^\\d{4}-\\d{2}-\\d{2}$");
+    }
+
+    function isValidTimestamp(ts) {
+      return ts is string && ts.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        (request.auth.token.email == "haritha4786999@gmail.com" && request.auth.token.email_verified == true);
+    }
+
+    // ===============================================================
+    // Domain Validators
+    // ===============================================================
+
+    function isValidUser(data) {
+      return data.keys().hasAll(['uid', 'email', 'createdAt']) &&
+             data.uid == request.auth.uid &&
+             isValidEmail(data.email) &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    function isValidReceipt(data) {
+      return data.keys().hasAll(['userId', 'date', 'merchant', 'category', 'amount', 'currency', 'createdAt']) &&
+             data.userId == request.auth.uid &&
+             isValidDate(data.date) &&
+             data.merchant is string && data.merchant.size() > 0 && data.merchant.size() < 200 &&
+             data.category is string &&
+             data.amount is number &&
+             data.currency is string && data.currency.size() == 3 &&
+             isValidTimestamp(data.createdAt);
+    }
+
+    // ===============================================================
+    // Match Rules
+    // ===============================================================
+
+    match /users/{userId} {
+      allow read: if isOwner(userId) || isAdmin();
+      allow create: if isOwner(userId) && isValidUser(request.resource.data);
+      allow update: if isOwner(userId) && isValidUser(request.resource.data);
+      allow delete: if isAdmin();
+    }
+
+    match /receipts/{receiptId} {
+      allow read: if isDocOwner() || isAdmin();
+      allow create: if isAuthenticated() && isValidReceipt(request.resource.data);
+      allow update: if isDocOwner() && isValidReceipt(request.resource.data) && uidNotModified();
+      allow delete: if isDocOwner() || isAdmin();
+    }
+
+    // Default deny
+    match /{path=**} {
+      allow read, write: if false;
+    }
+  }
+}
